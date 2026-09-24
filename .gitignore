@@ -4,6 +4,7 @@ __pycache__
 *.egg-info
 dist
 .venv
+fastchat/llm_judge/.env.plgrid
 
 # Log
 *.log

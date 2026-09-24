@@ -61,6 +61,8 @@ class Judge:
     prompt_template: dict
     ref_based: bool = False
     multi_turn: bool = False
+    api_dict: Optional[dict] = None
+    disable_thinking: bool = False
 
 
 @dataclasses.dataclass
@@ -132,6 +134,17 @@ def load_judge_prompts(prompt_file: str):
     return prompts
 
 
+def parse_single_rating(judgment):
+    if not judgment:
+        return -1
+    match = re.search(one_score_pattern, judgment)
+    if not match:
+        match = re.search(one_score_pattern_backup, judgment)
+    if match:
+        return ast.literal_eval(match.groups()[0])
+    return -1
+
+
 def run_judge_single(question, answer, judge, ref_answer, multi_turn=False):
     kwargs = {}
     model = judge.model_name
@@ -163,8 +176,15 @@ def run_judge_single(question, answer, judge, ref_answer, multi_turn=False):
     conv.append_message(conv.roles[0], user_prompt)
     conv.append_message(conv.roles[1], None)
 
-    if model in OPENAI_MODEL_LIST:
-        judgment = chat_completion_openai(model, conv, temperature=0, max_tokens=2048)
+    if model in OPENAI_MODEL_LIST or judge.api_dict is not None:
+        judgment = chat_completion_openai(
+            model,
+            conv,
+            temperature=0,
+            max_tokens=4096,
+            api_dict=judge.api_dict,
+            disable_thinking=judge.disable_thinking,
+        )
     elif model in ANTHROPIC_MODEL_LIST:
         judgment = chat_completion_anthropic(
             model, conv, temperature=0, max_tokens=1024
@@ -173,14 +193,26 @@ def run_judge_single(question, answer, judge, ref_answer, multi_turn=False):
         raise ValueError(f"Invalid judge model name: {model}")
 
     if judge.prompt_template["output_format"] == "[[rating]]":
-        match = re.search(one_score_pattern, judgment)
-        if not match:
-            match = re.search(one_score_pattern_backup, judgment)
-
-        if match:
-            rating = ast.literal_eval(match.groups()[0])
-        else:
-            rating = -1
+        rating = parse_single_rating(judgment)
+        if rating == -1 and (model in OPENAI_MODEL_LIST or judge.api_dict is not None):
+            conv.messages[-1][1] = judgment
+            conv.append_message(
+                conv.roles[0],
+                "Podaj wyłącznie końcową ocenę w skali 1-10, ściśle w formacie: "
+                "Rating: [[liczba]]",
+            )
+            conv.append_message(conv.roles[1], None)
+            rating_reply = chat_completion_openai(
+                model,
+                conv,
+                temperature=0,
+                max_tokens=64,
+                api_dict=judge.api_dict,
+                disable_thinking=judge.disable_thinking,
+            )
+            if rating_reply:
+                judgment = judgment + "\n\n" + rating_reply
+                rating = parse_single_rating(rating_reply)
     else:
         raise ValueError(
             f"invalid output format: {judge.prompt_template['output_format']}"
@@ -266,9 +298,16 @@ def run_judge_pair(question, answer_a, answer_b, judge, ref_answer, multi_turn=F
     conv.append_message(conv.roles[0], user_prompt)
     conv.append_message(conv.roles[1], None)
 
-    if model in OPENAI_MODEL_LIST:
+    if model in OPENAI_MODEL_LIST or judge.api_dict is not None:
         conv.set_system_message(system_prompt)
-        judgment = chat_completion_openai(model, conv, temperature=0, max_tokens=2048)
+        judgment = chat_completion_openai(
+            model,
+            conv,
+            temperature=0,
+            max_tokens=2048,
+            api_dict=judge.api_dict,
+            disable_thinking=judge.disable_thinking,
+        )
     elif model in ANTHROPIC_MODEL_LIST:
         if system_prompt != "You are a helpful assistant.":
             user_prompt = "[Instruction]\n" + system_prompt + "\n\n" + user_prompt
@@ -404,11 +443,18 @@ def play_a_match_pair(match: MatchPair, output_file: str):
     return result
 
 
-def chat_completion_openai(model, conv, temperature, max_tokens, api_dict=None):
+def chat_completion_openai(
+    model, conv, temperature, max_tokens, api_dict=None, disable_thinking=False
+):
     if api_dict is not None:
         openai.api_base = api_dict["api_base"]
         openai.api_key = api_dict["api_key"]
     output = API_ERROR_OUTPUT
+    extra_kwargs = {}
+    if disable_thinking:
+        extra_kwargs["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
     for _ in range(API_MAX_RETRY):
         try:
             messages = conv.to_openai_api_messages()
@@ -418,8 +464,13 @@ def chat_completion_openai(model, conv, temperature, max_tokens, api_dict=None):
                 n=1,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                request_timeout=300,
+                **extra_kwargs,
             )
-            output = response["choices"][0]["message"]["content"]
+            message = response["choices"][0]["message"]
+            output = message.get("content")
+            if output is None:
+                output = message.get("reasoning_content")
             break
         except openai.error.OpenAIError as e:
             print(type(e), e)
@@ -684,7 +735,9 @@ def get_single_judge_explanation(gamekey, judgment_dict):
         return "N/A"
 
 
-def check_data(questions, model_answers, ref_answers, models, judges):
+def check_data(
+    questions, model_answers, ref_answers, models, judges, reference_model="gpt-4"
+):
     # check model answers
     for m in models:
         assert m in model_answers, f"Missing model answer for {m}"
@@ -697,12 +750,15 @@ def check_data(questions, model_answers, ref_answers, models, judges):
     for jg in judges.values():
         if not jg.ref_based:
             continue
+        assert (
+            reference_model in ref_answers
+        ), f"Missing reference answers for {reference_model}"
         for q in questions:
             if q["category"] not in NEED_REF_CATS:
                 continue
             assert (
-                q["question_id"] in ref_answers[jg.model_name]
-            ), f"Missing reference answer to Question {q['question_id']} for judge {jg.model_name}"
+                q["question_id"] in ref_answers[reference_model]
+            ), f"Missing reference answer to Question {q['question_id']} for {reference_model}"
 
 
 def get_model_list(answer_dir):

@@ -5,6 +5,7 @@ python gen_judgment.py --model-list [LIST-OF-MODEL-ID] --parallel [num-concurren
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 
 import numpy as np
 from tqdm import tqdm
@@ -32,6 +33,7 @@ def make_match(
     baseline_model,
     ref_answers=None,
     multi_turn=False,
+    reference_model="gpt-4",
 ):
     matches = []
     for q in questions:
@@ -46,7 +48,7 @@ def make_match(
             a_1 = model_answers[m_1][q_id]
             a_2 = model_answers[baseline_model][q_id]
             if ref_answers is not None:
-                ref = ref_answers[judge.model_name][q_id]
+                ref = ref_answers[reference_model][q_id]
                 match = MatchPair(
                     dict(q),
                     m_1,
@@ -73,6 +75,7 @@ def make_match_all_pairs(
     baseline_model=None,
     ref_answers=None,
     multi_turn=False,
+    reference_model="gpt-4",
 ):
     matches = []
     for q in questions:
@@ -86,7 +89,7 @@ def make_match_all_pairs(
                 a_1 = model_answers[m_1][q_id]
                 a_2 = model_answers[m_2][q_id]
                 if ref_answers is not None:
-                    ref = ref_answers[judge.model_name][q_id]
+                    ref = ref_answers[reference_model][q_id]
                     match = MatchPair(
                         dict(q),
                         m_1,
@@ -113,6 +116,7 @@ def make_match_single(
     baseline_model=None,
     ref_answers=None,
     multi_turn=False,
+    reference_model="gpt-4",
 ):
     matches = []
     for q in questions:
@@ -123,7 +127,7 @@ def make_match_single(
             m = models[i]
             a = model_answers[m][q_id]
             if ref_answers is not None:
-                ref = ref_answers[judge.model_name][q_id]
+                ref = ref_answers[reference_model][q_id]
                 matches.append(
                     MatchSingle(
                         dict(q), m, a, judge, ref_answer=ref, multi_turn=multi_turn
@@ -134,34 +138,65 @@ def make_match_single(
     return matches
 
 
-def make_judge_pairwise(judge_model, judge_prompts):
+def make_judge_pairwise(judge_model, judge_prompts, api_dict=None, disable_thinking=False):
     judges = {}
-    judges["default"] = Judge(judge_model, judge_prompts["pair-v2"])
-    judges["math"] = Judge(judge_model, judge_prompts["pair-math-v1"], ref_based=True)
+    judges["default"] = Judge(
+        judge_model, judge_prompts["pair-v2"], api_dict=api_dict, disable_thinking=disable_thinking
+    )
+    judges["math"] = Judge(
+        judge_model,
+        judge_prompts["pair-math-v1"],
+        ref_based=True,
+        api_dict=api_dict,
+        disable_thinking=disable_thinking,
+    )
     judges["default-mt"] = Judge(
-        judge_model, judge_prompts["pair-v2-multi-turn"], multi_turn=True
+        judge_model,
+        judge_prompts["pair-v2-multi-turn"],
+        multi_turn=True,
+        api_dict=api_dict,
+        disable_thinking=disable_thinking,
     )
     judges["math-mt"] = Judge(
         judge_model,
         judge_prompts["pair-math-v1-multi-turn"],
         ref_based=True,
         multi_turn=True,
+        api_dict=api_dict,
+        disable_thinking=disable_thinking,
     )
     return judges
 
 
-def make_judge_single(judge_model, judge_prompts):
+def make_judge_single(judge_model, judge_prompts, api_dict=None, disable_thinking=False):
     judges = {}
-    judges["default"] = Judge(judge_model, judge_prompts["single-v1"])
-    judges["math"] = Judge(judge_model, judge_prompts["single-math-v1"], ref_based=True)
+    judges["default"] = Judge(
+        judge_model,
+        judge_prompts["single-v1"],
+        api_dict=api_dict,
+        disable_thinking=disable_thinking,
+    )
+    judges["math"] = Judge(
+        judge_model,
+        judge_prompts["single-math-v1"],
+        ref_based=True,
+        api_dict=api_dict,
+        disable_thinking=disable_thinking,
+    )
     judges["default-mt"] = Judge(
-        judge_model, judge_prompts["single-v1-multi-turn"], multi_turn=True
+        judge_model,
+        judge_prompts["single-v1-multi-turn"],
+        multi_turn=True,
+        api_dict=api_dict,
+        disable_thinking=disable_thinking,
     )
     judges["math-mt"] = Judge(
         judge_model,
         judge_prompts["single-math-v1-multi-turn"],
         ref_based=True,
         multi_turn=True,
+        api_dict=api_dict,
+        disable_thinking=disable_thinking,
     )
     return judges
 
@@ -181,6 +216,12 @@ if __name__ == "__main__":
         help="The file of judge prompts.",
     )
     parser.add_argument("--judge-model", type=str, default="gpt-4")
+    parser.add_argument(
+        "--reference-model",
+        type=str,
+        default="gpt-4",
+        help="Model whose reference answers are used for math/reasoning/coding.",
+    )
     parser.add_argument("--baseline-model", type=str, default="gpt-3.5-turbo")
     parser.add_argument(
         "--mode",
@@ -207,7 +248,36 @@ if __name__ == "__main__":
     parser.add_argument(
         "--first-n", type=int, help="A debug option. Only run the first `n` judgments."
     )
+    parser.add_argument(
+        "--openai-api-base",
+        type=str,
+        default=None,
+        help="OpenAI-compatible API base URL for the judge model.",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        type=str,
+        default=None,
+        help="API key for the judge endpoint (defaults to OPENAI_API_KEY).",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="Disable thinking mode for Qwen-style judge models.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip confirmation prompt before judging.",
+    )
     args = parser.parse_args()
+
+    api_dict = None
+    if args.openai_api_base is not None:
+        api_dict = {
+            "api_base": args.openai_api_base,
+            "api_key": args.openai_api_key or os.environ.get("OPENAI_API_KEY", "EMPTY"),
+        }
 
     question_file = f"data/{args.bench_name}/question.jsonl"
     answer_dir = f"data/{args.bench_name}/model_answer"
@@ -232,7 +302,12 @@ if __name__ == "__main__":
         models = args.model_list
 
     if args.mode == "single":
-        judges = make_judge_single(args.judge_model, judge_prompts)
+        judges = make_judge_single(
+            args.judge_model,
+            judge_prompts,
+            api_dict=api_dict,
+            disable_thinking=args.disable_thinking,
+        )
         play_a_match_func = play_a_match_single
         output_file = (
             f"data/{args.bench_name}/model_judgment/{args.judge_model}_single.jsonl"
@@ -240,7 +315,12 @@ if __name__ == "__main__":
         make_match_func = make_match_single
         baseline_model = None
     else:
-        judges = make_judge_pairwise(args.judge_model, judge_prompts)
+        judges = make_judge_pairwise(
+            args.judge_model,
+            judge_prompts,
+            api_dict=api_dict,
+            disable_thinking=args.disable_thinking,
+        )
         play_a_match_func = play_a_match_pair
         output_file = (
             f"data/{args.bench_name}/model_judgment/{args.judge_model}_pair.jsonl"
@@ -252,7 +332,14 @@ if __name__ == "__main__":
             make_match_func = make_match
             baseline_model = args.baseline_model
 
-    check_data(questions, model_answers, ref_answers, models, judges)
+    check_data(
+        questions,
+        model_answers,
+        ref_answers,
+        models,
+        judges,
+        reference_model=args.reference_model,
+    )
 
     question_math = [q for q in questions if q["category"] in NEED_REF_CATS]
     question_default = [q for q in questions if q["category"] not in NEED_REF_CATS]
@@ -260,7 +347,12 @@ if __name__ == "__main__":
     # Make matches
     matches = []
     matches += make_match_func(
-        question_default, models, model_answers, judges["default"], baseline_model
+        question_default,
+        models,
+        model_answers,
+        judges["default"],
+        baseline_model,
+        reference_model=args.reference_model,
     )
     matches += make_match_func(
         question_math,
@@ -269,6 +361,7 @@ if __name__ == "__main__":
         judges["math"],
         baseline_model,
         ref_answers,
+        reference_model=args.reference_model,
     )
     matches += make_match_func(
         question_default,
@@ -277,6 +370,7 @@ if __name__ == "__main__":
         judges["default-mt"],
         baseline_model,
         multi_turn=True,
+        reference_model=args.reference_model,
     )
     matches += make_match_func(
         question_math,
@@ -286,6 +380,7 @@ if __name__ == "__main__":
         baseline_model,
         ref_answers,
         multi_turn=True,
+        reference_model=args.reference_model,
     )
 
     match_stat = {}
@@ -301,7 +396,8 @@ if __name__ == "__main__":
     # Show match stats and prompt enter to continue
     print("Stats:")
     print(json.dumps(match_stat, indent=4))
-    input("Press Enter to confirm...")
+    if not args.yes:
+        input("Press Enter to confirm...")
 
     # Play matches
     if args.parallel == 1:
